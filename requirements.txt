@@ -1,0 +1,24 @@
+# GeM Tender Alert System — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Web scraping
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+
+# JS-rendered page scraping (fallback)
+selenium==4.18.1
+webdriver-manager==4.0.1
+
+# Scheduling
+APScheduler==3.10.4
+pytz==2024.1
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Email (built-in smtplib used, but yagmail as optional alternative)
+yagmail==0.15.293
+
+# Utilities
+fake-useragent==1.4.0
