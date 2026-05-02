@@ -1,163 +1,101 @@
 """
-main.py — GeM Tender Alert System Entry Point
-Wires together scraper, matcher, database, emailer, and scheduler.
+main.py — Entry point
 """
-
 import logging
 import os
 import sys
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Load .env FIRST before any other imports that read env vars
 load_dotenv()
 
 from scraper import scrape_all_portals
 from matcher import filter_tenders
-from database import (
-    init_db, is_new_tender, mark_tender_seen, mark_alerted,
-    log_alert_error, log_scrape, get_recent_tenders, get_stats,
-    get_consecutive_failures,
-)
+from database import (init_db, is_new_tender, mark_tender_seen, mark_alerted,
+                      log_alert_error, log_scrape, get_recent_tenders, get_stats,
+                      get_consecutive_failures)
 from emailer import send_tender_alert, send_daily_summary, send_admin_alert
 from scheduler import create_scheduler, start_scheduler
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+
 def setup_logging():
-    log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     logging.basicConfig(
-        level=logging.INFO,
-        format=log_format,
+        level=logging.INFO, format=fmt,
         handlers=[
             logging.FileHandler("scraper.log", encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
-        ],
+        ]
     )
+
 
 logger = logging.getLogger(__name__)
 
-# ── Core job: scrape + match + alert ─────────────────────────────────────────
-def run_scrape_cycle():
-    """
-    Full scrape cycle:
-    1. Scrape all 3 portals
-    2. Filter by keywords
-    3. For each new match → send instant email alert
-    4. Log results
-    """
-    cycle_start = datetime.now()
-    logger.info(f"=== Scrape cycle started: {cycle_start.strftime('%Y-%m-%d %H:%M:%S')} ===")
 
+def run_scrape_cycle():
+    start = datetime.now()
+    logger.info(f"=== Scrape cycle started: {start.strftime('%Y-%m-%d %H:%M:%S')} ===")
     try:
-        # Step 1: Scrape
         all_tenders = scrape_all_portals()
         logger.info(f"Total tenders fetched: {len(all_tenders)}")
-
-        # Step 2: Match keywords
         matched = filter_tenders(all_tenders)
         logger.info(f"Keyword-matched tenders: {len(matched)}")
-
-        # Step 3: Process new ones
         new_count = 0
-        for tender in matched:
-            bid_no = tender.get("bid_no", "")
-            if not bid_no:
+        for t in matched:
+            bid = t.get("bid_no","")
+            if not bid:
                 continue
-
-            if is_new_tender(bid_no):
-                # Mark as seen immediately to prevent duplicate sends
-                mark_tender_seen(tender)
-
-                logger.info(f"NEW tender found: {bid_no} — {tender.get('title','')[:60]}")
-                logger.info(f"  Keywords: {tender.get('matched_keywords', [])}")
-                logger.info(f"  Source: {tender.get('source', '')}")
-
-                # Send instant alert
-                success = send_tender_alert(tender)
-
-                if success:
-                    mark_alerted(bid_no)
-                    logger.info(f"Alert sent for: {bid_no}")
+            if is_new_tender(bid):
+                mark_tender_seen(t)
+                logger.info(f"NEW: {bid} — {t.get('title','')[:60]}")
+                logger.info(f"  Keywords: {t.get('matched_keywords',[])}")
+                if send_tender_alert(t):
+                    mark_alerted(bid)
+                    logger.info(f"  Alert sent ✓")
                 else:
-                    log_alert_error(bid_no, "Email send failed")
-                    logger.error(f"Alert FAILED for: {bid_no}")
-
+                    log_alert_error(bid, "Email failed")
+                    logger.error(f"  Alert FAILED for {bid}")
                 new_count += 1
-            else:
-                logger.debug(f"Already seen: {bid_no}")
-
-        # Step 4: Log this cycle
-        log_scrape(
-            portal="all",
-            found=len(all_tenders),
-            new=new_count,
-            success=True,
-        )
-
-        elapsed = (datetime.now() - cycle_start).seconds
-        logger.info(f"=== Cycle complete: {new_count} new alerts sent in {elapsed}s ===")
-
-        # Check for repeated failures and send admin alert
-        failures = get_consecutive_failures()
-        if failures >= 3:
-            send_admin_alert(
-                f"The GeM scraper has failed {failures} consecutive cycles. "
-                f"Please check scraper.log for details."
-            )
-
+        log_scrape("all", len(all_tenders), new_count, True)
+        elapsed = (datetime.now() - start).seconds
+        logger.info(f"=== Cycle done: {new_count} new alerts in {elapsed}s ===")
+        if get_consecutive_failures() >= 3:
+            send_admin_alert("Scraper failed 3 consecutive cycles. Check scraper.log.")
     except Exception as e:
-        logger.error(f"Scrape cycle crashed: {e}", exc_info=True)
-        log_scrape(portal="all", found=0, new=0, success=False, error=str(e))
+        logger.error(f"Cycle crashed: {e}", exc_info=True)
+        log_scrape("all", 0, 0, False, str(e))
 
 
-# ── Daily summary job ─────────────────────────────────────────────────────────
 def run_daily_summary():
-    """Send the 8 AM daily digest email."""
-    logger.info("Sending daily summary email...")
+    logger.info("Sending daily summary ...")
     try:
-        recent = get_recent_tenders(limit=50)
+        recent = get_recent_tenders(50)
         stats = get_stats()
-        success = send_daily_summary(recent, stats)
-        if success:
-            logger.info(f"Daily summary sent: {len(recent)} tender(s) included")
+        if send_daily_summary(recent, stats):
+            logger.info(f"Daily summary sent: {len(recent)} tenders")
         else:
-            logger.error("Daily summary email failed to send")
+            logger.error("Daily summary failed")
     except Exception as e:
-        logger.error(f"Daily summary crashed: {e}", exc_info=True)
+        logger.error(f"Daily summary error: {e}", exc_info=True)
 
 
-# ── Startup checks ────────────────────────────────────────────────────────────
 def check_config():
-    """Verify required environment variables are set."""
-    required = ["SMTP_USER", "SMTP_PASSWORD", "TO_EMAIL"]
-    missing = [k for k in required if not os.environ.get(k)]
+    missing = [k for k in ["SMTP_USER","SMTP_PASSWORD","TO_EMAIL"] if not os.environ.get(k)]
     if missing:
-        logger.error(f"Missing required .env variables: {', '.join(missing)}")
-        logger.error("Please configure your .env file before running.")
+        logger.error(f"Missing .env variables: {', '.join(missing)}")
         sys.exit(1)
-    logger.info("Configuration OK")
-    logger.info(f"Alerts will be sent to: {os.environ.get('TO_EMAIL')}")
-    logger.info(f"SMTP: {os.environ.get('SMTP_HOST')}:{os.environ.get('SMTP_PORT')}")
+    logger.info(f"Config OK — alerts → {os.environ.get('TO_EMAIL')}")
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
 def main():
     setup_logging()
-    logger.info("=" * 60)
-    logger.info("  GeM Tender Alert System — Starting Up")
-    logger.info("=" * 60)
-
-    # Check config
+    logger.info("=" * 55)
+    logger.info("  GeM Tender Alert System v5 — Starting")
+    logger.info("=" * 55)
     check_config()
-
-    # Initialise database
     init_db()
-
-    # Run one immediate cycle on startup so you get results right away
-    logger.info("Running initial scrape cycle on startup...")
+    logger.info("Running first scrape cycle now ...")
     run_scrape_cycle()
-
-    # Start the scheduler (runs forever)
     scheduler = create_scheduler(run_scrape_cycle, run_daily_summary)
     start_scheduler(scheduler)
 

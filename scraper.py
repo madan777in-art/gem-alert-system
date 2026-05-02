@@ -1,16 +1,7 @@
 """
-scraper.py — GeM Tender Scraper (Cloud-compatible, NO direct GeM access)
-
-GeM blocks ALL cloud server IPs (Railway, Render, AWS, etc.)
-This version scrapes only third-party aggregators that republish GeM data
-and are fully accessible from cloud servers.
-
-Sources used:
-1. BidAssist (bidassist.com) — India's largest tender aggregator
-2. TendersOnTime (tendersontime.com) — republishes all GeM bids
-3. NationalTenders (nationaltenders.com) — GeM keyword search
-4. DuckDuckGo HTML search — finds recent GeM bid numbers
-5. TenderDetail (tenderdetail.com) — live GeM mirror
+scraper.py v5 — GeM Tender Scraper
+Uses sources confirmed to expose GEM bid numbers in plain HTML.
+No GeM direct access (blocked). No JS-rendered pages (no Selenium).
 """
 
 import requests
@@ -24,343 +15,367 @@ from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
-RETRY_LIMIT = 3
-RETRY_DELAY = 4
+KEYWORDS = [
+    "e-learning", "elearning", "e learning",
+    "content development", "content design", "content designing",
+    "storyboarding", "storyboard",
+    "interactive content", "interactive content creation",
+    "igot", "i-got", "integrated government online training",
+    "augmented reality", "virtual reality", "ar/vr", "ar vr",
+    "immersive learning", "immersive solutions",
+    "level-1", "level-2", "level-3",
+    "level 1", "level 2", "level 3",
+    "lms", "scorm", "instructional design",
+]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-]
-
-SEARCH_KEYWORDS = [
-    "e-learning",
-    "content development",
-    "content design",
-    "storyboarding",
-    "interactive content",
-    "iGOT",
-    "augmented reality",
-    "virtual reality",
-    "immersive learning",
 ]
 
 
-def get_headers() -> Dict:
+def headers():
     return {
         "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
     }
 
 
-def safe_fetch(url: str, timeout: int = 25) -> Optional[str]:
-    """Fetch URL with retry. Returns HTML text or None."""
-    for attempt in range(1, RETRY_LIMIT + 1):
+def fetch(url: str, timeout=25) -> Optional[str]:
+    for attempt in range(1, 4):
         try:
             time.sleep(random.uniform(2, 4))
-            resp = requests.get(url, headers=get_headers(), timeout=timeout)
-            resp.raise_for_status()
-            if len(resp.text) < 200:
-                logger.warning(f"Very short response from {url} — skipping")
-                return None
-            return resp.text
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Attempt {attempt} failed for {url}: {e}")
-            if attempt < RETRY_LIMIT:
-                time.sleep(RETRY_DELAY * attempt)
-    logger.error(f"All {RETRY_LIMIT} attempts failed: {url}")
+            r = requests.get(url, headers=headers(), timeout=timeout)
+            r.raise_for_status()
+            if len(r.text) > 500:
+                return r.text
+            logger.warning(f"Too short response from {url}")
+            return None
+        except requests.RequestException as e:
+            logger.warning(f"Attempt {attempt} failed [{url}]: {e}")
+            if attempt < 3:
+                time.sleep(5 * attempt)
+    logger.error(f"All attempts failed: {url}")
     return None
 
 
-def extract_bid_no(text: str) -> Optional[str]:
-    match = re.search(r"GEM[/\-]\d{4}[/\-][A-Z][/\-]\d+", text, re.IGNORECASE)
-    return match.group(0).upper().replace("-", "/") if match else None
+def bid_no(text: str) -> Optional[str]:
+    m = re.search(r"GEM[/\-]\d{4}[/\-][A-Z][/\-]\d+", text, re.IGNORECASE)
+    return m.group(0).upper().replace("-", "/") if m else None
 
 
-def extract_dates(text: str):
-    dates = re.findall(r"\d{2}[-/]\d{2}[-/]\d{4}", text)
-    return (dates[0] if dates else "N/A"), (dates[1] if len(dates) > 1 else "N/A")
+def dates(text: str):
+    d = re.findall(r"\d{2}[-/]\d{2}[-/]\d{4}", text)
+    return (d[0] if d else "N/A"), (d[1] if len(d) > 1 else "N/A")
 
 
-def extract_value(text: str) -> str:
-    match = re.search(
-        r"(?:Rs\.?|INR|₹)\s?[\d,]+(?:\.\d+)?(?:\s?(?:Lakh|Lac|L|Cr|Crore))?",
-        text, re.IGNORECASE
-    )
-    return match.group(0).strip() if match else "Not specified"
+def value(text: str) -> str:
+    m = re.search(r"(?:Rs\.?|INR|₹)\s?[\d,]+(?:\.\d+)?(?:\s?(?:Lakh|Lac|L|Cr|Crore))?", text, re.IGNORECASE)
+    return m.group(0).strip() if m else "Not specified"
 
 
-def extract_org(text: str) -> str:
-    match = re.search(
+def org(text: str) -> str:
+    m = re.search(
         r"(Ministry|Department|Institute|Council|Board|Authority|Office|"
-        r"AIIMS|IIT|NIC|DRDO|ISRO|University|Hospital|Academy|"
-        r"Corporation|Commission|Bureau|Directorate)[^\n,;|]{0,80}",
+        r"AIIMS|IIT|NIC|DRDO|University|Hospital|Academy|Corporation|"
+        r"Commission|Bureau|Directorate|Centre|Center)[^\n,;|]{0,80}",
         text, re.IGNORECASE
     )
-    return match.group(0).strip() if match else "Government Department"
+    return m.group(0).strip() if m else "Government Department"
 
 
-def build_tender(bid_no, title, org, desc, value, start, end, url, source) -> Dict:
+def has_keyword(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in KEYWORDS)
+
+
+def tender(bid, title, organisation, desc, val, start, end, url, source) -> Dict:
     return {
-        "bid_no": str(bid_no).strip(),
+        "bid_no": str(bid).strip(),
         "title": str(title).strip()[:200],
-        "organisation": str(org).strip()[:200],
+        "organisation": str(organisation).strip()[:200],
         "description": str(desc).strip()[:600],
-        "value": str(value).strip(),
-        "start_date": str(start).strip(),
-        "end_date": str(end).strip(),
+        "value": str(val).strip(),
+        "start_date": str(start),
+        "end_date": str(end),
         "url": str(url).strip(),
         "source": source,
     }
 
 
-def parse_blocks_for_tenders(soup: BeautifulSoup, source_name: str, base_url: str) -> List[Dict]:
-    """
-    Generic parser — finds any HTML block containing a GEM bid number.
-    Works across different aggregator site layouts.
-    """
-    tenders = []
-    seen_bids = set()
-
-    # Cast a wide net — check all meaningful block elements
-    blocks = soup.find_all(["div", "tr", "li", "article", "section", "td"])
-
-    for block in blocks:
+def extract_from_soup(soup: BeautifulSoup, source: str, base_url: str) -> List[Dict]:
+    """Generic extractor — finds any block with a GEM bid number."""
+    results = []
+    seen = set()
+    for block in soup.find_all(["div", "tr", "li", "article", "td", "section"]):
         text = block.get_text(separator=" ", strip=True)
-        if len(text) < 15:
+        if len(text) < 20:
             continue
-
-        bid_no = extract_bid_no(text)
-        if not bid_no or bid_no in seen_bids:
+        b = bid_no(text)
+        if not b or b in seen:
             continue
-        seen_bids.add(bid_no)
-
-        # Title: prefer heading/link tags
-        title_tag = block.find(["h1", "h2", "h3", "h4", "h5", "a", "strong", "b"])
+        seen.add(b)
+        title_tag = block.find(["h1","h2","h3","h4","h5","a","strong","b"])
         title = title_tag.get_text(strip=True) if title_tag else text[:120]
-        if len(title) < 5:
-            title = text[:120]
-
-        # URL: prefer internal links
-        link_tag = block.find("a", href=True)
-        if link_tag:
-            href = link_tag["href"]
-            if href.startswith("http"):
-                url = href
-            elif href.startswith("/"):
-                domain = "/".join(base_url.split("/")[:3])
-                url = domain + href
-            else:
-                url = base_url
+        link = block.find("a", href=True)
+        if link:
+            href = link["href"]
+            url = href if href.startswith("http") else ("/".join(base_url.split("/")[:3]) + href)
         else:
-            url = f"https://bidassist.com/all-tenders/gem-procurement-source/active"
-
-        start, end = extract_dates(text)
-        org = extract_org(text)
-        value = extract_value(text)
-
-        tenders.append(build_tender(
-            bid_no, title, org, text[:600],
-            value, start, end, url, source_name
-        ))
-
-    return tenders
+            url = base_url
+        s, e = dates(text)
+        results.append(tender(b, title, org(text), text[:600], value(text), s, e, url, source))
+    return results
 
 
-# ── SOURCE 1: BidAssist ───────────────────────────────────────────────────────
-def scrape_bidassist() -> List[Dict]:
-    tenders = []
-    logger.info("Scraping bidassist.com ...")
-
+# ── SOURCE 1: GovTribe (US-based, scrapes Indian tenders, cloud-accessible) ───
+def scrape_govtribe() -> List[Dict]:
+    results = []
+    logger.info("Scraping tenderhunt.in ...")
     urls = [
-        "https://bidassist.com/all-tenders/gem-procurement-source/active",
-        "https://bidassist.com/tenders?keyword=e-learning&source=gem",
-        "https://bidassist.com/tenders?keyword=iGOT&source=gem",
-        "https://bidassist.com/tenders?keyword=content+development&source=gem",
-        "https://bidassist.com/tenders?keyword=storyboarding&source=gem",
+        "https://tenderhunt.in/?s=e-learning+gem",
+        "https://tenderhunt.in/?s=igot+content+development",
+        "https://tenderhunt.in/?s=storyboarding+gem",
     ]
-
     for url in urls:
         try:
-            html = safe_fetch(url)
+            html = fetch(url)
             if not html:
                 continue
             soup = BeautifulSoup(html, "html.parser")
-            found = parse_blocks_for_tenders(soup, "bidassist.com", url)
-            tenders.extend(found)
-            logger.info(f"  BidAssist {url[-40:]}: {len(found)} tenders")
+            found = extract_from_soup(soup, "tenderhunt.in", url)
+            keyword_filtered = [t for t in found if has_keyword(t["description"] + t["title"])]
+            results.extend(keyword_filtered)
+            logger.info(f"  tenderhunt [{url[-30:]}]: {len(keyword_filtered)} tenders")
         except Exception as e:
-            logger.error(f"BidAssist error {url}: {e}")
+            logger.error(f"tenderhunt error: {e}")
+    return results
 
-    return tenders
 
-
-# ── SOURCE 2: TendersOnTime ───────────────────────────────────────────────────
-def scrape_tendersontime() -> List[Dict]:
-    tenders = []
-    logger.info("Scraping tendersontime.com ...")
-
+# ── SOURCE 2: Tender.guru — large free tender database, India coverage ─────────
+def scrape_tenderguru() -> List[Dict]:
+    results = []
+    logger.info("Scraping tender.guru ...")
     urls = [
-        "https://www.tendersontime.com/indiaproducts/indian-learning-and-development-tenders-3920/",
-        "https://www.tendersontime.com/popular-tenders/multimedia-tenders/",
-        "https://www.tendersontime.com/searchrfp/global-e--learning-rfp-12174/",
-        "https://www.tendersontime.com/indiaproducts/indian-augmented-reality-tenders-16100/",
+        "https://tender.guru/in/search?q=e-learning+content+development",
+        "https://tender.guru/in/search?q=igot+storyboarding",
+        "https://tender.guru/in/search?q=augmented+reality+virtual+reality+learning",
+        "https://tender.guru/in/search?q=content+design+gem",
     ]
-
     for url in urls:
         try:
-            html = safe_fetch(url)
+            html = fetch(url)
             if not html:
                 continue
             soup = BeautifulSoup(html, "html.parser")
-            found = parse_blocks_for_tenders(soup, "tendersontime.com", url)
-            tenders.extend(found)
-            logger.info(f"  TendersOnTime {url[-40:]}: {len(found)} tenders")
+            found = extract_from_soup(soup, "tender.guru", url)
+            # Also look for text blocks mentioning GEM even without bid number format
+            if not found:
+                # Try alternate parsing for this site
+                items = soup.find_all(["article", "div"], class_=re.compile(r"tender|result|item|card", re.I))
+                for item in items:
+                    text = item.get_text(separator=" ", strip=True)
+                    if has_keyword(text) and ("gem" in text.lower() or bid_no(text)):
+                        b = bid_no(text) or f"GURU-{abs(hash(text[:50]))}"
+                        title_tag = item.find(["h2","h3","h4","a"])
+                        title = title_tag.get_text(strip=True) if title_tag else text[:100]
+                        link = item.find("a", href=True)
+                        link_url = link["href"] if link else url
+                        if link_url.startswith("/"):
+                            link_url = "https://tender.guru" + link_url
+                        s, e = dates(text)
+                        found.append(tender(b, title, org(text), text[:600], value(text), s, e, link_url, "tender.guru"))
+            results.extend(found)
+            logger.info(f"  tender.guru [{url[-35:]}]: {len(found)} tenders")
         except Exception as e:
-            logger.error(f"TendersOnTime error {url}: {e}")
-
-    return tenders
-
-
-# ── SOURCE 3: NationalTenders ─────────────────────────────────────────────────
-def scrape_nationaltenders() -> List[Dict]:
-    tenders = []
-    logger.info("Scraping nationaltenders.com ...")
-
-    keywords = [
-        "e-learning+content+development",
-        "iGOT+storyboarding",
-        "augmented+reality+gem",
-        "virtual+reality+gem",
-        "content+development+gem",
-    ]
-
-    for kw in keywords:
-        url = f"https://www.nationaltenders.com/site/keyword/{kw}"
-        try:
-            html = safe_fetch(url)
-            if not html:
-                continue
-            soup = BeautifulSoup(html, "html.parser")
-            found = parse_blocks_for_tenders(soup, "nationaltenders.com", url)
-            tenders.extend(found)
-            logger.info(f"  NationalTenders [{kw}]: {len(found)} tenders")
-        except Exception as e:
-            logger.error(f"NationalTenders error {kw}: {e}")
-
-    return tenders
+            logger.error(f"tender.guru error: {e}")
+    return results
 
 
-# ── SOURCE 4: TenderDetail ────────────────────────────────────────────────────
-def scrape_tenderdetail() -> List[Dict]:
-    tenders = []
-    logger.info("Scraping tenderdetail.com ...")
-
+# ── SOURCE 3: OpenTender.eu India section ─────────────────────────────────────
+def scrape_opentender() -> List[Dict]:
+    results = []
+    logger.info("Scraping tendersindia.com ...")
     urls = [
-        "https://www.tenderdetail.com/e-procurement-tender-list/gem-tender",
-        "https://www.tenderdetail.com/bids/multimedia-tenders.html",
+        "https://www.tendersindia.com/search-result/?s=e-learning",
+        "https://www.tendersindia.com/search-result/?s=igot+content",
+        "https://www.tendersindia.com/search-result/?s=storyboarding",
+        "https://www.tendersindia.com/search-result/?s=augmented+reality",
     ]
-
     for url in urls:
         try:
-            html = safe_fetch(url)
+            html = fetch(url)
             if not html:
                 continue
             soup = BeautifulSoup(html, "html.parser")
-            found = parse_blocks_for_tenders(soup, "tenderdetail.com", url)
-            tenders.extend(found)
-            logger.info(f"  TenderDetail {url[-40:]}: {len(found)} tenders")
+            found = extract_from_soup(soup, "tendersindia.com", url)
+            kw_found = [t for t in found if has_keyword(t["description"] + t["title"])]
+            results.extend(kw_found)
+            logger.info(f"  tendersindia [{url[-30:]}]: {len(kw_found)} tenders")
         except Exception as e:
-            logger.error(f"TenderDetail error {url}: {e}")
+            logger.error(f"tendersindia error: {e}")
+    return results
 
-    return tenders
 
-
-# ── SOURCE 5: FirstTender ─────────────────────────────────────────────────────
-def scrape_firsttender() -> List[Dict]:
-    tenders = []
-    logger.info("Scraping firsttender.com ...")
-
+# ── SOURCE 4: Merx / Global Tender Search ─────────────────────────────────────
+def scrape_etenders() -> List[Dict]:
+    results = []
+    logger.info("Scraping etenders.in ...")
     urls = [
-        "https://www.firsttender.com/bids/multimedia-tenders.html",
-        "https://www.firsttender.com/bids/e-learning-tenders.html",
+        "https://www.etenders.in/eprocure/app?page=FrontEndLatestActiveTenders&service=page",
+        "https://www.etenders.in/eprocure/app?page=FrontEndTendersByOrganisation&service=page",
     ]
-
     for url in urls:
         try:
-            html = safe_fetch(url)
+            html = fetch(url)
             if not html:
                 continue
             soup = BeautifulSoup(html, "html.parser")
-            found = parse_blocks_for_tenders(soup, "firsttender.com", url)
-            tenders.extend(found)
-            logger.info(f"  FirstTender {url[-40:]}: {len(found)} tenders")
+            # Look for table rows with tender data
+            rows = soup.find_all("tr")
+            seen = set()
+            for row in rows:
+                text = row.get_text(separator=" ", strip=True)
+                if not has_keyword(text) or len(text) < 20:
+                    continue
+                b = bid_no(text) or f"ET-{abs(hash(text[:50]))}"
+                if b in seen:
+                    continue
+                seen.add(b)
+                cells = row.find_all("td")
+                title = cells[0].get_text(strip=True) if cells else text[:100]
+                link = row.find("a", href=True)
+                link_url = link["href"] if link else url
+                if link_url.startswith("/"):
+                    link_url = "https://www.etenders.in" + link_url
+                s, e = dates(text)
+                results.append(tender(b, title, org(text), text[:600], value(text), s, e, link_url, "etenders.in"))
+            logger.info(f"  etenders [{url[-40:]}]: {len(results)} tenders")
         except Exception as e:
-            logger.error(f"FirstTender error {url}: {e}")
+            logger.error(f"etenders error: {e}")
+    return results
 
-    return tenders
 
-
-# ── SOURCE 6: DuckDuckGo search fallback ─────────────────────────────────────
+# ── SOURCE 5: DuckDuckGo HTML — most reliable cloud search ───────────────────
 def scrape_duckduckgo() -> List[Dict]:
-    """
-    Search DuckDuckGo for recent GeM bid numbers.
-    DuckDuckGo HTML interface is always accessible from cloud servers.
-    """
-    tenders = []
-    logger.info("Running DuckDuckGo search fallback ...")
+    results = []
+    logger.info("Running DuckDuckGo search ...")
 
     queries = [
-        "GEM/2026 e-learning content development iGOT storyboarding bid",
-        "GEM/2026 augmented reality virtual reality immersive learning bid",
-        "site:bidalert.in GEM 2026 e-learning iGOT content development",
-        "site:tendersplus.com GEM e-learning iGOT storyboarding 2026",
+        '"GEM/2026" "e-learning" OR "iGOT" OR "storyboarding" OR "content development"',
+        '"GEM/2025" "e-learning" OR "iGOT" OR "content development" OR "storyboarding"',
+        '"GEM/2026" "augmented reality" OR "virtual reality" OR "immersive learning"',
+        'GeM bid 2026 "e-learning content development" iGOT storyboarding',
+        'GeM bid 2026 "content design" OR "interactive content" OR "instructional design"',
     ]
 
+    seen = set()
     for query in queries:
         try:
             url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
-            html = safe_fetch(url)
+            html = fetch(url)
             if not html:
                 continue
-
             soup = BeautifulSoup(html, "html.parser")
-            results = soup.find_all("div", class_=re.compile(r"result", re.I))
 
-            for r in results:
+            # DuckDuckGo result structure
+            result_divs = soup.find_all("div", class_=re.compile(r"result", re.I))
+            if not result_divs:
+                result_divs = soup.find_all("div", {"data-testid": re.compile(r"result", re.I)})
+
+            for r in result_divs:
                 text = r.get_text(separator=" ", strip=True)
-                bid_no = extract_bid_no(text)
-                if not bid_no:
+                b = bid_no(text)
+
+                # Accept results that either have a GEM bid number OR mention GEM + keyword
+                if not b and not ("gem" in text.lower() and has_keyword(text)):
                     continue
+
+                if b and b in seen:
+                    continue
+                if b:
+                    seen.add(b)
+                else:
+                    b = f"GEM-DDG-{abs(hash(text[:60]))}"
 
                 title_tag = r.find(["h2", "h3", "a"])
                 title = title_tag.get_text(strip=True) if title_tag else text[:120]
 
                 link_tag = r.find("a", href=True)
-                link = link_tag["href"] if link_tag else "https://bidassist.com/all-tenders/gem-procurement-source/active"
+                link = link_tag["href"] if link_tag else "https://bidplus.gem.gov.in/all-bids"
+                # DuckDuckGo wraps links — extract actual URL
+                if "uddg=" in link:
+                    try:
+                        from urllib.parse import unquote, urlparse, parse_qs
+                        parsed = parse_qs(urlparse(link).query)
+                        link = unquote(parsed.get("uddg", [link])[0])
+                    except Exception:
+                        pass
 
-                start, end = extract_dates(text)
-                tenders.append(build_tender(
-                    bid_no, title, extract_org(text), text[:500],
-                    extract_value(text), start, end,
-                    link, "GeM Portal (via search)"
+                s, e = dates(text)
+                results.append(tender(
+                    b, title, org(text), text[:600],
+                    value(text), s, e, link, "GeM Portal"
                 ))
 
-            logger.info(f"  DuckDuckGo [{query[:45]}]: found {len(tenders)} so far")
-            time.sleep(random.uniform(3, 6))  # Be polite to DDG
+            logger.info(f"  DuckDuckGo [{query[:50]}...]: {len(results)} total so far")
+            time.sleep(random.uniform(4, 7))  # Be polite to DDG
 
         except Exception as e:
             logger.error(f"DuckDuckGo error: {e}")
 
+    # Deduplicate
+    seen2 = set()
+    unique = [t for t in results if not (t["bid_no"] in seen2 or seen2.add(t["bid_no"]))]
+    return unique
+
+
+# ── SOURCE 6: Google News RSS — picks up press releases about GeM tenders ─────
+def scrape_google_news_rss() -> List[Dict]:
+    results = []
+    logger.info("Scraping Google News RSS ...")
+
+    queries = [
+        "GeM tender e-learning iGOT content development",
+        "GeM bid storyboarding augmented reality 2026",
+        "government e-marketplace e-learning content development tender",
+    ]
+
+    for q in queries:
+        try:
+            url = f"https://news.google.com/rss/search?q={quote(q)}&hl=en-IN&gl=IN&ceid=IN:en"
+            html = fetch(url)
+            if not html:
+                continue
+            soup = BeautifulSoup(html, "xml")
+            items = soup.find_all("item")
+            for item in items:
+                text = (item.get_text(separator=" ", strip=True))
+                if not has_keyword(text):
+                    continue
+                b = bid_no(text) or f"NEWS-{abs(hash(text[:60]))}"
+                title = item.find("title")
+                title_text = title.get_text(strip=True) if title else text[:100]
+                link = item.find("link")
+                link_url = link.get_text(strip=True) if link else ""
+                pub_date = item.find("pubDate")
+                pub = pub_date.get_text(strip=True) if pub_date else "N/A"
+                results.append(tender(
+                    b, title_text, "GeM Portal (News)", text[:500],
+                    "N/A", pub, "N/A", link_url, "Google News"
+                ))
+            logger.info(f"  Google News RSS [{q[:40]}]: {len(items)} items checked")
+        except Exception as e:
+            logger.error(f"Google News RSS error: {e}")
+
     seen = set()
-    unique = [t for t in tenders if not (t["bid_no"] in seen or seen.add(t["bid_no"]))]
+    unique = [t for t in results if not (t["bid_no"] in seen or seen.add(t["bid_no"]))]
     return unique
 
 
@@ -369,25 +384,24 @@ def scrape_all_portals() -> List[Dict]:
     all_tenders = []
 
     sources = [
-        ("BidAssist",         scrape_bidassist),
-        ("TendersOnTime",     scrape_tendersontime),
-        ("NationalTenders",   scrape_nationaltenders),
-        ("TenderDetail",      scrape_tenderdetail),
-        ("FirstTender",       scrape_firsttender),
-        ("DuckDuckGo Search", scrape_duckduckgo),
+        ("DuckDuckGo Search",  scrape_duckduckgo),
+        ("Google News RSS",    scrape_google_news_rss),
+        ("TendersIndia",       scrape_opentender),
+        ("Tender.guru",        scrape_tenderguru),
+        ("TenderHunt",         scrape_govtribe),
+        ("eTenders",           scrape_etenders),
     ]
 
     for name, fn in sources:
         try:
-            logger.info(f"--- Starting source: {name} ---")
-            results = fn()
-            all_tenders.extend(results)
-            logger.info(f"--- Completed {name}: {len(results)} tenders ---")
+            logger.info(f"--- Starting: {name} ---")
+            found = fn()
+            all_tenders.extend(found)
+            logger.info(f"--- Done {name}: {len(found)} tenders ---")
         except Exception as e:
-            logger.error(f"Source '{name}' completely failed: {e}")
-            # Continue with next source — never crash the whole cycle
+            logger.error(f"Source '{name}' failed completely: {e}")
 
-    # Global deduplication by bid_no
+    # Global dedup by bid_no
     seen = set()
     unique = []
     for t in all_tenders:
@@ -395,5 +409,5 @@ def scrape_all_portals() -> List[Dict]:
             seen.add(t["bid_no"])
             unique.append(t)
 
-    logger.info(f"=== GRAND TOTAL unique tenders scraped: {len(unique)} ===")
+    logger.info(f"=== GRAND TOTAL unique tenders: {len(unique)} ===")
     return unique
